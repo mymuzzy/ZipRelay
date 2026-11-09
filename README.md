@@ -4,12 +4,19 @@ Send folders between computers on the same network as verified ZIP archives. Wor
 
 ## How it works
 
-Two scripts, one job each:
+- `receive.py` runs on the destination machine, waits for uploads, and keeps the verified ZIPs.
+- `send.py` runs on the source machine and sends **one ZIP at a time**.
 
-- `receive.py` runs on the destination machine and waits for uploads.
-- `send.py` runs on the source machine, zips every visible top-level item of a folder (`Desktop` becomes `Desktop.zip`), and uploads each ZIP in chunks.
+Point `send.py` at a folder (or a single file) and choose a mode with `--mode` or by answering its prompt:
 
-Every ZIP is checked with SHA-256 before it counts as finished. Interrupted? Rerun the same command and it picks up at the byte where it stopped.
+| Mode | What you get | Best for |
+|---|---|---|
+| `each` | One ZIP per visible item inside the folder, sent one after another (`Desktop.zip`, `Photos.zip`, `notes.txt.zip`) | Big folders: small uploads, little spare disk space, cheap retries |
+| `whole` | The folder itself as a single ZIP | Small folders you want as one file |
+
+**What happens in `each` mode:** the sender packs the next item into a ZIP, uploads it in chunks, and the receiver checks its SHA-256. Once the receiver confirms, the sender deletes its temporary ZIP, saves a tiny receipt, and moves on. A folder holding 15 files and 10 subfolders becomes 25 ZIPs (each subfolder's contents stay inside its own ZIP), and the sender never holds more than one at a time. The receiver keeps every verified ZIP.
+
+**Stop and continue:** press Ctrl+C whenever you like and rerun the same command. Items already delivered are confirmed with the receiver and skipped, the interrupted one continues from its last byte, and the rest are packed fresh.
 
 ## Quick start
 
@@ -33,6 +40,8 @@ Every ZIP is checked with SHA-256 before it counts as finished. Interrupted? Rer
    python send.py --source "/path/to/source" --host 192.168.1.50 --token YOUR_TOKEN
    ```
 
+Run `python send.py` with no arguments and it asks for what is missing: drag a folder or file into the terminal window to paste its path, enter the receiver's IP, then pick `each` or `whole`.
+
 Use `py -3` on Windows or `python3` on macOS/Linux if that is how you launch Python. To send a drive, use `--source G:/`.
 
 ## Settings
@@ -41,8 +50,9 @@ Prefer editing a file over typing flags? Each script has a marked section at the
 
 | Option | Script | Default | Meaning |
 |---|---|---|---|
-| `--source` | send | none (required) | Folder to back up |
-| `--host` | send | none (required) | Receiver's IP or hostname |
+| `--source` | send | asked if missing | Folder or file to send |
+| `--host` | send | asked if missing | Receiver's IP or hostname |
+| `--mode` | send | asked if missing | `each` (one ZIP per item) or `whole` (folder as one ZIP) |
 | `--dest` | receive | `received` | Where finished ZIPs are kept |
 | `--bind` | receive | `0.0.0.0` | Interface to listen on |
 | `--port` | both | `8765` | TCP port |
@@ -60,7 +70,7 @@ Run either script with `--help` for the full list.
 
 - The receiver keeps unfinished uploads as hidden `.part` files and tells the sender how many bytes it has.
 - A bad hash triggers one retry from byte zero. The sender deletes its staged ZIP only after the receiver confirms the hash.
-- Finished items are remembered, so a rerun skips them. Keep the sender's `--state` folder and the receiver's `.part` files between runs.
+- Finished items are remembered, so a rerun skips them (the receiver is asked to confirm it still has the same hash). Keep the sender's `--state` folder and the receiver's `.part` files between runs.
 - A rerun continues the *same* backup. If the source changed since the first run, start a new snapshot with a fresh `--state` and a fresh `--dest`, and close programs that write to the source while it runs.
 - Use one receiver per destination. A verified upload replaces an existing ZIP of the same name. Names that clash on a case-insensitive destination, or that the receiver's filesystem can't store, must be renamed first.
 
