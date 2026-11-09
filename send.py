@@ -4,7 +4,7 @@ from contextlib import closing
 from http.client import HTTPConnection, HTTPException
 from pathlib import Path
 from urllib.parse import quote
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_DEFLATED, ZIP_STORED, ZipFile
 
 if sys.version_info < (3, 9):
     sys.exit("ZipRelay needs Python 3.9 or newer.")
@@ -25,13 +25,33 @@ STATE = "~/.ziprelay"    # staging area for ZIPs and resume info; keep it betwee
 # ───────────── NOTHING BELOW NEEDS CHANGING ─────────────
 
 BLOCK = 1 << 20
+STORED = {".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus", ".jpg", ".jpeg", ".png", ".webp",
+          ".mp4", ".mkv", ".mov", ".zip", ".7z", ".rar", ".gz"}  # already compressed: skip the CPU work
+last_draw = 0
 
 
-def sha256(path):
-    h = hashlib.sha256()
+def mb(n):
+    return f"{n / 2**20:,.1f} MB"
+
+
+def progress(done, total, note="", end=False):
+    """Redraw a one-line bar (at most 5 times a second); end=True draws the final state and moves on."""
+    global last_draw
+    if not end and time.monotonic() - last_draw < 0.2:
+        return
+    last_draw, n = time.monotonic(), 24 * done // total
+    print(f"\r[{'#' * n}{'-' * (24 - n)}] {done / total:6.1%}  {mb(done)}/{mb(total)}{note}   ",
+          end="\n" if end else "", flush=True)
+
+
+def sha256(path, show=False):
+    h, done, total = hashlib.sha256(), 0, path.stat().st_size or 1
     with path.open("rb") as f:
         for block in iter(lambda: f.read(BLOCK), b""):
             h.update(block)
+            done += len(block)
+            if show: progress(done, total)
+    if show: progress(total, total, end=True)
     return h.hexdigest()
 
 
@@ -69,20 +89,33 @@ def fail(error):
     raise error
 
 
-def pack(source, item, archive):
+def listing(item):
+    """(path, size) for the item and everything selected under it; a folder comes before its contents."""
+    if item.is_file():
+        return [(item, item.stat().st_size)]
+    found = []
+    for folder, dirs, files in os.walk(item, onerror=fail):
+        here = Path(folder)
+        dirs[:] = sorted(d for d in dirs if selected(here / d))
+        found.append((here, 0))
+        found += [(here / f, (here / f).stat().st_size) for f in sorted(files) if selected(here / f)]
+    return found
+
+
+def pack(root, item, archive):
     tmp = archive.with_suffix(".tmp")  # only a finished ZIP ever gets the real name
+    paths = listing(item)
+    total = sum(size for _, size in paths) or 1
+    print(f"  {len(paths):,} entries, {mb(total)} to pack", flush=True)
+    done = 0
     try:
         with ZipFile(tmp, "w", ZIP_DEFLATED, compresslevel=1, strict_timestamps=False) as z:
-            if item.is_file():
-                z.write(item, item.name)
-            else:
-                for folder, dirs, files in os.walk(item, onerror=fail):
-                    here = Path(folder)
-                    dirs[:] = sorted(d for d in dirs if selected(here / d))
-                    z.write(here, here.relative_to(source))
-                    for name in sorted(files):
-                        if selected(here / name):
-                            z.write(here / name, (here / name).relative_to(source))
+            for i, (path, size) in enumerate(paths, 1):
+                arc = path.name if item.is_file() else path.relative_to(root)  # ZIP always stores "/" separators
+                z.write(path, arc, compress_type=ZIP_STORED if path.suffix.lower() in STORED else ZIP_DEFLATED)
+                done += size
+                progress(done, total, f"  {i:,}/{len(paths):,} entries")
+        progress(total, total, f"  {len(paths):,}/{len(paths):,} entries", end=True)
         tmp.replace(archive)
     finally:
         tmp.unlink(missing_ok=True)
@@ -90,7 +123,7 @@ def pack(source, item, archive):
 
 def chunks(archive, size, offset):
     """Yield the ZIP from `offset` onward, drawing a progress bar as we go."""
-    sent, last = offset, 0
+    sent = offset
     with archive.open("rb") as f:
         f.seek(offset)
         while sent < size:
@@ -99,11 +132,9 @@ def chunks(archive, size, offset):
                 raise OSError("The staging ZIP was truncated during upload.")
             yield block
             sent += len(block)
-            if time.monotonic() - last >= 0.2 or sent == size:
-                n = 24 * sent // size
-                print(f"\r[{'#' * n}{'-' * (24 - n)}] {sent / size:6.1%}  {sent:,}/{size:,} bytes",
-                      end="\n" if sent == size else "", flush=True)
-                last = time.monotonic()
+            progress(sent, size)
+    progress(size, size, end=True)
+    print("Waiting for the receiver to verify...", flush=True)
 
 
 def request(a, method, name="", size=0, digest="", archive=None, offset=0):
@@ -138,7 +169,7 @@ def transfer(a, item, archive):
         print(f"Packing {item.name!r}", flush=True)
         pack(a.root, item, archive)
     print(f"Hashing {name!r}", flush=True)
-    size, digest = archive.stat().st_size, sha256(archive)
+    size, digest = archive.stat().st_size, sha256(archive, show=True)
 
     for attempt in range(2):  # a second pass only happens after a hash mismatch
         status, headers = request(a, "HEAD", name, size, digest)
